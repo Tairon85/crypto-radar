@@ -1,3 +1,5 @@
+# Crypto Radar V0.2.1 - Railway refresh build
+# Updated main.py to force a fresh GitHub commit/deploy.
 import json, math, os, random, sqlite3, threading, time, uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -35,7 +37,7 @@ REFERENCE_POSITIONS = {
 
 DEFAULT_SYMBOLS = ["TAO", "UNI", "AVAX", "XRP", "SUI", "ETH", "SOL", "LINK", "AAVE", "ADA", "XLM"]
 
-app = FastAPI(title="Crypto Radar – Continuous Analyst", version="0.2.0")
+app = FastAPI(title="Crypto Radar – Continuous Analyst", version="0.2.1")
 prices: Dict[str, deque] = defaultdict(lambda: deque(maxlen=240))
 latest: Dict[str, dict] = {}
 lock = threading.Lock()
@@ -294,7 +296,7 @@ def status():
             "realized_total":round(realized_total,2),"closed_count":len(closed),"win_rate":round(win_rate,1),
             "avg_win":round(avg_win,2),"avg_loss":round(avg_loss,2),
             "open":ots,"closed":closed,"decisions":decisions,"reference_positions":REFERENCE_POSITIONS,
-            "poll_seconds":POLL_SECONDS,"version":"0.2.0"}
+            "poll_seconds":POLL_SECONDS,"version":"0.2.1"}
 
 @app.post("/api/reset-paper")
 def reset_paper():
@@ -304,7 +306,7 @@ def reset_paper():
 DASH='''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Crypto Radar</title>
 <style>
 *{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#0b1020;color:#eef2ff;margin:0}.wrap{max-width:1100px;margin:auto;padding:18px}.top{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card{background:#151c33;border:1px solid #26304d;border-radius:16px;padding:16px;min-width:0}.big{font-size:28px;font-weight:800}.muted{color:#9ba8c7}.positive{color:#56d58a}.negative{color:#ff7070}.grid{display:grid;grid-template-columns:1fr;gap:12px;margin-top:14px}.row{display:flex;justify-content:space-between;align-items:center;gap:10px;border-bottom:1px solid #27304a;padding:12px 0}.row:last-child{border-bottom:0}.right{text-align:right}.badge{padding:6px 10px;border-radius:999px;background:#24304f;font-weight:800;white-space:nowrap}.enter{background:#175d3d}.wait{background:#674b11}.hold{background:#174662}h1{margin:0 0 4px;font-size:34px;line-height:1.05}.section{font-size:23px;margin:0 0 8px}.reason{max-width:66vw}.statline{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.pill{background:#202a46;border-radius:10px;padding:7px 9px}.protect{color:#ffd166}@media(min-width:850px){.top{grid-template-columns:repeat(4,1fr)}.grid{grid-template-columns:1.1fr 1fr 1fr}.reason{max-width:260px}}
-</style></head><body><div class="wrap"><h1>Crypto Radar – Continuous Analyst</h1><div class="muted">V0.2 • paper trading • aggiornamento automatico</div><div class="top" id="summary"></div><div class="grid"><div class="card"><h3 class="section">Posizioni simulate</h3><div id="openTrades"></div></div><div class="card"><h3 class="section">Radar</h3><div id="radarList"></div></div><div class="card"><h3 class="section">Storico chiusure</h3><div id="closedTrades"></div></div></div></div><script>
+</style></head><body><div class="wrap"><h1>Crypto Radar – Continuous Analyst</h1><div class="muted">V0.2.1 • paper trading • aggiornamento automatico</div><div class="top" id="summary"></div><div class="grid"><div class="card"><h3 class="section">Posizioni simulate</h3><div id="openTrades"></div></div><div class="card"><h3 class="section">Radar</h3><div id="radarList"></div></div><div class="card"><h3 class="section">Storico chiusure</h3><div id="closedTrades"></div></div></div></div><script>
 const euro=x=>'€'+Number(x||0).toFixed(2); const cls=x=>Number(x)>=0?'positive':'negative';
 const age=m=>m<60?`${m} min`:m<1440?`${(m/60).toFixed(1)} h`:`${(m/1440).toFixed(1)} g`;
 async function tick(){

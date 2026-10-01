@@ -1,8 +1,8 @@
-# Crypto Radar – Continuous Analyst V0.1
+# Crypto Radar – Continuous Analyst V0.2
 
 Prima versione del test da **€50 virtuali**. L'app osserva continuamente le crypto, costruisce una serie di prezzi, calcola trend/momentum/RSI/volatilità, genera `ENTRA / ASPETTA / TIENI`, apre operazioni **paper** fino a €10 e applica un trailing dinamico.
 
-## Sicurezza della V0.1
+## Sicurezza della V0.2
 - `APP_MODE=paper`: non invia ordini reali.
 - Capitale virtuale iniziale: €50.
 - Max €10 per trade, max 3 posizioni.

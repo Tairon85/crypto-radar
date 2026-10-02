@@ -1,5 +1,5 @@
-# Crypto Radar V0.2.1 - Railway refresh build
-# Updated main.py to force a fresh GitHub commit/deploy.
+# Crypto Radar V0.3 - risk/reward tuning build
+# Paper-trading experiment: tighter losses, earlier profit protection, cooldown, clearer metrics.
 import json, math, os, random, sqlite3, threading, time, uuid
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -18,6 +18,11 @@ MAX_TRADE = float(os.getenv("MAX_TRADE_EUR", "10"))
 MAX_OPEN = int(os.getenv("MAX_OPEN_POSITIONS", "3"))
 MAX_DAILY_LOSS = float(os.getenv("MAX_DAILY_LOSS_EUR", "2"))
 MIN_RR = float(os.getenv("MIN_RR", "1.8"))
+ENTRY_SCORE = float(os.getenv("ENTRY_SCORE", "82"))
+HARD_STOP_PCT = float(os.getenv("HARD_STOP_PCT", "2.4")) / 100.0
+EARLY_EXIT_LOSS_PCT = float(os.getenv("EARLY_EXIT_LOSS_PCT", "1.2")) / 100.0
+BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "1.5")) / 100.0
+COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", "20"))
 API_KEY = os.getenv("ETORO_API_KEY", "").strip()
 USER_KEY = os.getenv("ETORO_USER_KEY", "").strip()
 WATCHLIST_RAW = os.getenv("ETORO_WATCHLIST_JSON", "").strip()
@@ -37,7 +42,7 @@ REFERENCE_POSITIONS = {
 
 DEFAULT_SYMBOLS = ["TAO", "UNI", "AVAX", "XRP", "SUI", "ETH", "SOL", "LINK", "AAVE", "ADA", "XLM"]
 
-app = FastAPI(title="Crypto Radar – Continuous Analyst", version="0.2.1")
+app = FastAPI(title="Crypto Radar – Continuous Analyst", version="0.3")
 prices: Dict[str, deque] = defaultdict(lambda: deque(maxlen=240))
 latest: Dict[str, dict] = {}
 lock = threading.Lock()
@@ -94,6 +99,16 @@ def today_realized_pnl():
     day=datetime.now(timezone.utc).date().isoformat()
     c=db(); r=c.execute("SELECT COALESCE(SUM(pnl_eur),0) FROM trades WHERE status='CLOSED' AND substr(closed_at,1,10)=?", (day,)).fetchone(); c.close()
     return float(r[0] or 0)
+
+
+def in_cooldown(symbol: str) -> bool:
+    c=db(); r=c.execute("SELECT closed_at FROM trades WHERE symbol=? AND status='CLOSED' ORDER BY id DESC LIMIT 1", (symbol,)).fetchone(); c.close()
+    if not r or not r[0]: return False
+    try:
+        closed=datetime.fromisoformat(str(r[0]).replace('Z','+00:00'))
+        return (datetime.now(timezone.utc)-closed).total_seconds() < COOLDOWN_MINUTES*60
+    except Exception:
+        return False
 
 
 def ema(vals: List[float], period: int) -> Optional[float]:
@@ -184,6 +199,7 @@ def paper_open(symbol, price, score, reason):
     if APP_MODE != "paper": return
     ots=open_trades()
     if len(ots)>=MAX_OPEN or any(t["symbol"]==symbol for t in ots): return
+    if in_cooldown(symbol): return
     if today_realized_pnl() <= -MAX_DAILY_LOSS: return
     cash=get_cash(); amount=min(MAX_TRADE,cash)
     if amount<2: return
@@ -199,17 +215,38 @@ def paper_manage(symbol, price, f):
     if not row: c.close(); return
     t=dict(row); peak=max(t["peak_price"],price)
     gain=price/t["entry_price"]-1
+    peak_gain=peak/t["entry_price"]-1
     protected=t["protected_price"]
-    # Dynamic profit protection: wider while trend is strong, tighter after +5%/+10%.
-    if gain>=0.10: protected=max(protected or 0, peak*0.965)
-    elif gain>=0.05: protected=max(protected or 0, peak*0.975)
-    elif gain>=0.025: protected=max(protected or 0, t["entry_price"]*1.005)
-    hard_stop=t["entry_price"]*(1-0.03)
-    weakening=(f and f["fast"] and f["slow"] and f["fast"]<f["slow"] and f["momentum"]<0)
+
+    fast=f.get("fast") if f else None; slow=f.get("slow") if f else None
+    mom=f.get("momentum",0) if f else 0; rr=f.get("rsi",50) if f else 50
+    strong=bool(fast and slow and fast>slow and mom>0.20 and rr<72)
+    weakening=bool(fast and slow and fast<slow and mom<0)
+
+    # V0.3: protect earlier, but keep a wider leash while trend is strong.
+    if peak_gain >= BREAKEVEN_TRIGGER_PCT:
+        protected=max(protected or 0, t["entry_price"]*1.001)
+    if peak_gain >= 0.025:
+        trail=0.018 if strong else 0.012
+        protected=max(protected or 0, peak*(1-trail))
+    if peak_gain >= 0.05:
+        trail=0.024 if strong else 0.014
+        protected=max(protected or 0, peak*(1-trail), t["entry_price"]*1.015)
+    if peak_gain >= 0.08:
+        trail=0.028 if strong else 0.016
+        protected=max(protected or 0, peak*(1-trail), t["entry_price"]*1.03)
+
+    hard_stop=t["entry_price"]*(1-HARD_STOP_PCT)
     reason=None
-    if protected and price<=protected: reason="trailing intelligente: profitto protetto"
-    elif price<=hard_stop: reason="stop rischio -3%"
-    elif gain>0.01 and weakening: reason="struttura/momentum deteriorati"
+    if protected and price<=protected:
+        reason="trailing V0.3: profitto protetto"
+    elif price<=hard_stop:
+        reason=f"stop rischio -{HARD_STOP_PCT*100:.1f}%"
+    elif gain<=-EARLY_EXIT_LOSS_PCT and weakening:
+        reason="stop dinamico: perdita + momentum deteriorato"
+    elif gain>0.008 and weakening:
+        reason="struttura/momentum deteriorati"
+
     if reason:
         pnl=(price-t["entry_price"])*t["units"]
         now=datetime.now(timezone.utc).isoformat()
@@ -228,7 +265,7 @@ def analyze_and_act(symbol, price):
     paper_manage(symbol,price,f)
     score, reason=score_setup(f)
     action="ASPETTA"
-    if score>=78 and f["momentum"]<2.5: action="ENTRA"
+    if score>=ENTRY_SCORE and 42 <= f["rsi"] <= 70 and 0.10 <= f["momentum"] < 2.2 and not in_cooldown(symbol): action="ENTRA"
     if any(t["symbol"]==symbol for t in open_trades()): action="TIENI"
     c=db(); c.execute("INSERT INTO decisions(ts,symbol,action,score,price,reason,rsi,fast,slow,momentum,volatility) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                      (datetime.now(timezone.utc).isoformat(),symbol,action,score,price,reason,f["rsi"],f["fast"],f["slow"],f["momentum"],f["volatility"])); c.commit(); c.close()
@@ -290,13 +327,20 @@ def status():
     win_rate=(len(wins)/len(closed)*100) if closed else 0
     avg_win=(sum(float(x['pnl_eur']) for x in wins)/len(wins)) if wins else 0
     avg_loss=(sum(float(x['pnl_eur']) for x in losses)/len(losses)) if losses else 0
+    gross_win=sum(float(x['pnl_eur']) for x in wins) if wins else 0
+    gross_loss=abs(sum(float(x['pnl_eur']) for x in losses)) if losses else 0
+    profit_factor=(gross_win/gross_loss) if gross_loss>0 else (999.0 if gross_win>0 else 0)
+    expectancy=(realized_total/len(closed)) if closed else 0
+    for t in ots:
+        t['peak_pnl_pct']=(t['peak_price']/t['entry_price']-1)*100 if t['entry_price'] else 0
+        t['protected_pct']=((t['protected_price']/t['entry_price']-1)*100) if t.get('protected_price') and t['entry_price'] else None
     return {"mode":APP_MODE,"feed":"eToro" if (API_KEY and USER_KEY and parse_watchlist()) else "SIMULATORE",
             "starting_cash":STARTING_CASH,"cash":round(get_cash(),2),"equity":round(equity,2),
             "unrealized":round(unreal,2),"today_realized":round(today_realized_pnl(),2),
-            "realized_total":round(realized_total,2),"closed_count":len(closed),"win_rate":round(win_rate,1),
-            "avg_win":round(avg_win,2),"avg_loss":round(avg_loss,2),
+            "realized_total":round(realized_total,2),"closed_count":len(closed),"open_count":len(ots),"total_trades":len(closed)+len(ots),"win_rate":round(win_rate,1),
+            "avg_win":round(avg_win,2),"avg_loss":round(avg_loss,2),"profit_factor":round(profit_factor,2),"expectancy":round(expectancy,2),
             "open":ots,"closed":closed,"decisions":decisions,"reference_positions":REFERENCE_POSITIONS,
-            "poll_seconds":POLL_SECONDS,"version":"0.2.1"}
+            "poll_seconds":POLL_SECONDS,"version":"0.3","entry_score":ENTRY_SCORE,"hard_stop_pct":round(HARD_STOP_PCT*100,2),"cooldown_minutes":COOLDOWN_MINUTES}
 
 @app.post("/api/reset-paper")
 def reset_paper():
@@ -306,17 +350,17 @@ def reset_paper():
 DASH='''<!doctype html><html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Crypto Radar</title>
 <style>
 *{box-sizing:border-box}body{font-family:system-ui,-apple-system,sans-serif;background:#0b1020;color:#eef2ff;margin:0}.wrap{max-width:1100px;margin:auto;padding:18px}.top{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card{background:#151c33;border:1px solid #26304d;border-radius:16px;padding:16px;min-width:0}.big{font-size:28px;font-weight:800}.muted{color:#9ba8c7}.positive{color:#56d58a}.negative{color:#ff7070}.grid{display:grid;grid-template-columns:1fr;gap:12px;margin-top:14px}.row{display:flex;justify-content:space-between;align-items:center;gap:10px;border-bottom:1px solid #27304a;padding:12px 0}.row:last-child{border-bottom:0}.right{text-align:right}.badge{padding:6px 10px;border-radius:999px;background:#24304f;font-weight:800;white-space:nowrap}.enter{background:#175d3d}.wait{background:#674b11}.hold{background:#174662}h1{margin:0 0 4px;font-size:34px;line-height:1.05}.section{font-size:23px;margin:0 0 8px}.reason{max-width:66vw}.statline{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}.pill{background:#202a46;border-radius:10px;padding:7px 9px}.protect{color:#ffd166}@media(min-width:850px){.top{grid-template-columns:repeat(4,1fr)}.grid{grid-template-columns:1.1fr 1fr 1fr}.reason{max-width:260px}}
-</style></head><body><div class="wrap"><h1>Crypto Radar – Continuous Analyst</h1><div class="muted">V0.2.1 • paper trading • aggiornamento automatico</div><div class="top" id="summary"></div><div class="grid"><div class="card"><h3 class="section">Posizioni simulate</h3><div id="openTrades"></div></div><div class="card"><h3 class="section">Radar</h3><div id="radarList"></div></div><div class="card"><h3 class="section">Storico chiusure</h3><div id="closedTrades"></div></div></div></div><script>
+</style></head><body><div class="wrap"><h1>Crypto Radar – Continuous Analyst</h1><div class="muted">V0.3 • paper trading • rischio dinamico + profit protection</div><div class="top" id="summary"></div><div class="grid"><div class="card"><h3 class="section">Posizioni simulate</h3><div id="openTrades"></div></div><div class="card"><h3 class="section">Radar</h3><div id="radarList"></div></div><div class="card"><h3 class="section">Storico chiusure</h3><div id="closedTrades"></div></div></div></div><script>
 const euro=x=>'€'+Number(x||0).toFixed(2); const cls=x=>Number(x)>=0?'positive':'negative';
 const age=m=>m<60?`${m} min`:m<1440?`${(m/60).toFixed(1)} h`:`${(m/1440).toFixed(1)} g`;
 async function tick(){
  let s=await (await fetch('/api/status',{cache:'no-store'})).json();
  const summary=document.getElementById('summary'), openEl=document.getElementById('openTrades'), radarEl=document.getElementById('radarList'), closedEl=document.getElementById('closedTrades');
- summary.innerHTML=`<div class=card><div class=muted>Equity</div><div class=big>${euro(s.equity)}</div></div><div class=card><div class=muted>Cash</div><div class=big>${euro(s.cash)}</div></div><div class=card><div class=muted>P/L aperto</div><div class="big ${cls(s.unrealized)}">${euro(s.unrealized)}</div><div class=muted>Realizzato oggi ${euro(s.today_realized)}</div></div><div class=card><div class=muted>Test</div><div class=big>${s.closed_count} trade</div><div class=muted>Win rate ${Number(s.win_rate).toFixed(1)}% • Feed ${s.feed}</div></div>`;
- openEl.innerHTML=s.open.length?s.open.map(x=>`<div class=row><div class=reason><b>${x.symbol}</b> • ${euro(x.amount_eur)}<br><small>${Number(x.entry_price).toFixed(4)} → ${Number(x.current_price).toFixed(4)} • ${age(x.age_minutes)}</small><br><small class=muted>${x.reason_open||''}</small>${x.protected_price?`<br><small class=protect>Profitto protetto da ${Number(x.protected_price).toFixed(4)}</small>`:''}</div><div class=right><b class="${cls(x.pnl_eur)}">${euro(x.pnl_eur)}</b><br><small class="${cls(x.pnl_pct)}">${Number(x.pnl_pct).toFixed(2)}%</small></div></div>`).join(''):'<div class=muted>Nessuna posizione aperta</div>';
+ summary.innerHTML=`<div class=card><div class=muted>Equity</div><div class=big>${euro(s.equity)}</div></div><div class=card><div class=muted>Cash</div><div class=big>${euro(s.cash)}</div></div><div class=card><div class=muted>P/L aperto</div><div class="big ${cls(s.unrealized)}">${euro(s.unrealized)}</div><div class=muted>Realizzato oggi ${euro(s.today_realized)}</div></div><div class=card><div class=muted>Test</div><div class=big>${s.open_count} aperti • ${s.closed_count} chiusi</div><div class=muted>Win ${Number(s.win_rate).toFixed(1)}% • PF ${Number(s.profit_factor).toFixed(2)} • Exp ${euro(s.expectancy)}</div></div>`;
+ openEl.innerHTML=s.open.length?s.open.map(x=>`<div class=row><div class=reason><b>${x.symbol}</b> • ${euro(x.amount_eur)}<br><small>${Number(x.entry_price).toFixed(4)} → ${Number(x.current_price).toFixed(4)} • ${age(x.age_minutes)}</small><br><small class=muted>${x.reason_open||''}</small><br><small class=muted>Max +${Number(x.peak_pnl_pct||0).toFixed(2)}%</small>${x.protected_price?`<br><small class=protect>Protezione ${Number(x.protected_price).toFixed(4)} (${Number(x.protected_pct||0).toFixed(2)}%)</small>`:''}</div><div class=right><b class="${cls(x.pnl_eur)}">${euro(x.pnl_eur)}</b><br><small class="${cls(x.pnl_pct)}">${Number(x.pnl_pct).toFixed(2)}%</small></div></div>`).join(''):'<div class=muted>Nessuna posizione aperta</div>';
  let uniq=[];let seen=new Set();for(const d of s.decisions){if(!seen.has(d.symbol)){seen.add(d.symbol);uniq.push(d)}}
  radarEl.innerHTML=uniq.slice(0,15).map(d=>`<div class=row><span><b>${d.symbol}</b><br><small>${Number(d.price).toFixed(4)} • score ${Number(d.score).toFixed(0)}</small><br><small class=muted>RSI ${d.rsi==null?'—':Number(d.rsi).toFixed(0)} • mom ${d.momentum==null?'—':Number(d.momentum).toFixed(2)}%</small></span><span class="badge ${d.action==='ENTRA'?'enter':d.action==='TIENI'?'hold':'wait'}">${d.action}</span></div>`).join('');
- closedEl.innerHTML=`<div class=statline><span class=pill>Realizzato ${euro(s.realized_total)}</span><span class=pill>Win ${Number(s.win_rate).toFixed(0)}%</span><span class=pill>Media + ${euro(s.avg_win)}</span><span class=pill>Media − ${euro(s.avg_loss)}</span></div>`+(s.closed.length?s.closed.slice(0,12).map(x=>`<div class=row><div><b>${x.symbol}</b><br><small>${Number(x.entry_price).toFixed(4)} → ${Number(x.exit_price||x.current_price).toFixed(4)}</small><br><small class=muted>${x.reason_close||''}</small></div><div class=right><b class="${cls(x.pnl_eur)}">${euro(x.pnl_eur)}</b></div></div>`).join(''):'<div class=muted style="margin-top:12px">Nessuna chiusura ancora</div>');
+ closedEl.innerHTML=`<div class=statline><span class=pill>Realizzato ${euro(s.realized_total)}</span><span class=pill>Win ${Number(s.win_rate).toFixed(0)}%</span><span class=pill>Media + ${euro(s.avg_win)}</span><span class=pill>Media − ${euro(s.avg_loss)}</span><span class=pill>PF ${Number(s.profit_factor).toFixed(2)}</span><span class=pill>Exp ${euro(s.expectancy)}</span></div>`+(s.closed.length?s.closed.slice(0,12).map(x=>`<div class=row><div><b>${x.symbol}</b><br><small>${Number(x.entry_price).toFixed(4)} → ${Number(x.exit_price||x.current_price).toFixed(4)}</small><br><small class=muted>${x.reason_close||''}</small></div><div class=right><b class="${cls(x.pnl_eur)}">${euro(x.pnl_eur)}</b></div></div>`).join(''):'<div class=muted style="margin-top:12px">Nessuna chiusura ancora</div>');
 }
 tick();setInterval(tick,5000);</script></body></html>'''
 
